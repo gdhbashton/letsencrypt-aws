@@ -288,8 +288,8 @@ def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
             logger, acme_client, elb_name, authorizations, csr)
 
         f=open(fullchain_path, 'w')
-        f.write(pem_certificate_chain)
         f.write(pem_certificate)
+        f.write(pem_certificate_chain)
         f.close()
     finally:
         for authz_record in authorizations:
