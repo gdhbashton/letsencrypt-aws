@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import datetime
 import json
 import os
@@ -21,6 +23,7 @@ import OpenSSL.crypto
 
 import rfc3986
 
+import botocore
 
 DEFAULT_ACME_DIRECTORY_URL = "https://acme-v01.api.letsencrypt.org/directory"
 CERTIFICATE_EXPIRATION_THRESHOLD = datetime.timedelta(days=45)
@@ -133,17 +136,18 @@ def generate_certificate_name(hosts, cert):
     )[:128]
 
 
-def get_load_balancer_certificate(elb_client, elb_name, elb_port):
+def get_load_balancer_certificate(elb_client, elb_name, listener):
+    elb_port = listener.get("load_balancer_port", 443)
     response = elb_client.describe_load_balancers(
         LoadBalancerNames=[elb_name]
     )
     [description] = response["LoadBalancerDescriptions"]
-    [certificate_id] = [
-        listener["Listener"]["SSLCertificateId"]
-        for listener in description["ListenerDescriptions"]
-        if listener["Listener"]["LoadBalancerPort"] == elb_port
-    ]
-    return certificate_id
+
+    for listener in description["ListenerDescriptions"]:
+        if listener["Listener"]["LoadBalancerPort"] == elb_port:
+            return listener["Listener"]["SSLCertificateId"]
+
+    return False
 
 
 def get_expiration_date_for_certificate(iam_client, ssl_certificate_arn):
@@ -245,56 +249,10 @@ def request_certificate(logger, acme_client, elb_name, authorizations, csr):
     return pem_certificate, pem_certificate_chain
 
 
-def add_certificate_to_elb(logger, elb_client, iam_client, elb_name, elb_port,
-                           hosts, private_key, pem_certificate,
-                           pem_certificate_chain):
-    logger.emit("updating-elb.upload-iam-certificate", elb_name=elb_name)
-    response = iam_client.upload_server_certificate(
-        ServerCertificateName=generate_certificate_name(
-            hosts,
-            x509.load_pem_x509_certificate(pem_certificate, default_backend())
-        ),
-        PrivateKey=private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        ),
-        CertificateBody=pem_certificate,
-        CertificateChain=pem_certificate_chain,
-    )
-    new_cert_arn = response["ServerCertificateMetadata"]["Arn"]
-
-    # Sleep before trying to set the certificate, it appears to sometimes fail
-    # without this.
-    time.sleep(15)
-    logger.emit("updating-elb.set-elb-certificate", elb_name=elb_name)
-    elb_client.set_load_balancer_listener_ssl_certificate(
-        LoadBalancerName=elb_name,
-        SSLCertificateId=new_cert_arn,
-        LoadBalancerPort=elb_port,
-    )
-
-
 def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
-               force_issue, elb_name, elb_port, hosts, key_type):
+               force_issue, elb_name, listener, hosts, key_type, cert_only,
+               create_listener, fullchain_path, privatekey_path):
     logger.emit("updating-elb", elb_name=elb_name)
-    certificate_id = get_load_balancer_certificate(
-        elb_client, elb_name, elb_port
-    )
-
-    expiration_date = get_expiration_date_for_certificate(
-        iam_client, certificate_id
-    ).date()
-    logger.emit(
-        "updating-elb.certificate-expiration",
-        elb_name=elb_name, expiration_date=expiration_date
-    )
-    days_until_expiration = expiration_date - datetime.date.today()
-    if (
-        days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
-        not force_issue
-    ):
-        return
 
     if key_type == "rsa":
         private_key = generate_rsa_private_key()
@@ -302,6 +260,15 @@ def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
         private_key = generate_ecdsa_private_key()
     else:
         raise ValueError("Invalid key_type: {!r}".format(key_type))
+
+    f=open(privatekey_path, 'w')
+    f.write(private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    f.close()
+
     csr = generate_csr(private_key, hosts)
 
     authorizations = []
@@ -318,15 +285,12 @@ def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
             )
 
         pem_certificate, pem_certificate_chain = request_certificate(
-            logger, acme_client, elb_name, authorizations, csr
-        )
+            logger, acme_client, elb_name, authorizations, csr)
 
-        add_certificate_to_elb(
-            logger,
-            elb_client, iam_client,
-            elb_name, elb_port, hosts,
-            private_key, pem_certificate, pem_certificate_chain
-        )
+        f=open(fullchain_path, 'w')
+        f.write(pem_certificate_chain)
+        f.write(pem_certificate)
+        f.close()
     finally:
         for authz_record in authorizations:
             logger.emit(
@@ -344,7 +308,7 @@ def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
 
 
 def update_elbs(logger, acme_client, elb_client, route53_client, iam_client,
-                force_issue, domains):
+                force_issue, domains, cert_only, create_listener, fullchain_path, privatekey_path):
     for domain in domains:
         update_elb(
             logger,
@@ -354,9 +318,13 @@ def update_elbs(logger, acme_client, elb_client, route53_client, iam_client,
             iam_client,
             force_issue,
             domain["elb"]["name"],
-            domain["elb"].get("port", 443),
+            domain["elb"].get("listener", {'load_balancer_port': 443}),
             domain["hosts"],
-            domain.get("key_type", "rsa")
+            domain.get("key_type", "rsa"),
+            cert_only,
+            create_listener,
+            fullchain_path,
+            privatekey_path
         )
 
 
@@ -394,15 +362,24 @@ def cli():
 
 @cli.command(name="update-certificates")
 @click.option(
-    "--persistent", is_flag=True, help="Runs in a loop, instead of just once."
-)
-@click.option(
     "--force-issue", is_flag=True, help=(
         "Issue a new certificate, even if the old one isn't close to "
         "expiration."
     )
 )
-def update_certificates(persistent=False, force_issue=False):
+@click.option(
+    "--cert-only", is_flag=True, help=(
+        "Only issue the certificate. Do not attempt to add the certificate "
+        "to the ELB."
+    )
+)
+@click.option(
+    "--create-listener", is_flag=True, help=(
+        "Create the HTTPS listener if it is missing."
+    )
+)
+def update_certificates(persistent=False, force_issue=False,
+                        cert_only=False, create_listener=False):
     logger = Logger()
     logger.emit("startup")
 
@@ -417,7 +394,7 @@ def update_certificates(persistent=False, force_issue=False):
 
     # Structure: {
     #     "domains": [
-    #         {"elb": {"name" "...", "port" 443}, hosts: ["..."]}
+    #         {"elb": {"name" "...", "listener": { ... }}, hosts: ["..."]}
     #     ],
     #     "acme_account_key": "s3://bucket/object",
     #     "acme_directory_url": "(optional)"
@@ -428,26 +405,18 @@ def update_certificates(persistent=False, force_issue=False):
         "acme_directory_url", DEFAULT_ACME_DIRECTORY_URL
     )
     acme_account_key = config["acme_account_key"]
+    fullchain_path = config["cert_fullchain_path"]
+    privatekey_path = config["cert_privatekey_path"]
+
     acme_client = setup_acme_client(
         s3_client, acme_directory_url, acme_account_key
     )
 
-    if persistent:
-        logger.emit("running", mode="persistent")
-        while True:
-            update_elbs(
-                logger, acme_client, elb_client, route53_client, iam_client,
-                force_issue, domains
-            )
-            # Sleep before we check again
-            logger.emit("sleeping", duration=PERSISTENT_SLEEP_INTERVAL)
-            time.sleep(PERSISTENT_SLEEP_INTERVAL)
-    else:
-        logger.emit("running", mode="single")
-        update_elbs(
-            logger, acme_client, elb_client, route53_client, iam_client,
-            force_issue, domains
-        )
+    logger.emit("running", mode="single")
+    update_elbs(
+        logger, acme_client, elb_client, route53_client, iam_client,
+        force_issue, domains, cert_only, create_listener, fullchain_path, privatekey_path
+    )
 
 
 @cli.command()
